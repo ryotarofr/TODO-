@@ -33,7 +33,8 @@
       "WebFetch(domain:v2.tauri.app)",
       "Bash(git checkout:*)",
       "Bash(dir:*)",
-      "Bash(where:*)"
+      "Bash(where:*)",
+      "Bash(wc:*)"
     ]
   }
 }
