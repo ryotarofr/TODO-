@@ -41,7 +41,14 @@
       "Bash(bun -e:*)",
       "WebFetch(domain:eden.so)",
       "Bash(ls:*)",
-      "WebFetch(domain:ai.google.dev)"
+      "WebFetch(domain:ai.google.dev)",
+      "WebFetch(domain:effect.website)",
+      "WebFetch(domain:runharbor.com)",
+      "WebFetch(domain:ethanniser.dev)",
+      "WebFetch(domain:dnlytras.com)",
+      "WebFetch(domain:www.thoughtworks.com)",
+      "WebFetch(domain:bundlephobia.com)",
+      "Bash(gh api:*)"
     ]
   }
 }

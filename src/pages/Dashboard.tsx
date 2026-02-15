@@ -1,6 +1,6 @@
 import { GridStack } from "gridstack";
 import "gridstack/dist/gridstack.min.css";
-import { useParams } from "@solidjs/router";
+import { useNavigate, useParams, useSearchParams } from "@solidjs/router";
 import {
 	ArrowLeftIcon,
 	BarChart3Icon,
@@ -20,6 +20,7 @@ import {
 	PlayIcon,
 	PlusIcon,
 	SaveIcon,
+	SearchIcon,
 	SettingsIcon,
 	Share2Icon,
 	SquareIcon,
@@ -126,6 +127,14 @@ import {
 	saveTemplate,
 } from "./dashboard/templateManager";
 import { clearAllSummaryCaches } from "./dashboard/summaryCache";
+import {
+	buildGlobalIndex,
+	buildLocalIndex,
+	scrollToAndHighlight,
+	searchIndex,
+	type SearchResult,
+	type SearchableField,
+} from "./dashboard/searchPalette";
 
 // GridStackはデフォルトでtextContent（XSS対策）を使用する。
 // ウィジェットHTML（チャート、テーブル、リッチテキスト等）を正しく描画するためinnerHTMLに上書きする。
@@ -135,6 +144,8 @@ GridStack.renderCB = (el, w) => {
 
 export default function Dashboard() {
 	const params = useParams<{ id: string }>();
+	const navigate = useNavigate();
+	const [searchParams, setSearchParams] = useSearchParams();
 	const navCtx = useContext(NavItemsContext);
 	const auth = useAuth();
 	let gridRef!: HTMLDivElement;
@@ -219,6 +230,14 @@ export default function Dashboard() {
 		CollaborationUser[]
 	>([]);
 
+	// === 検索パレット ===
+	const [searchOpen, setSearchOpen] = createSignal(false);
+	const [searchQuery, setSearchQuery] = createSignal("");
+	const [searchResults, setSearchResults] = createSignal<SearchResult[]>([]);
+	const [searchSelectedIdx, setSearchSelectedIdx] = createSignal(0);
+	let searchIndexCache: SearchableField[] = [];
+	let searchDebounceTimer: ReturnType<typeof setTimeout> | undefined;
+
 	// エッジコンテキストメニュー
 	const [edgeContextMenu, setEdgeContextMenu] = createSignal<{
 		x: number;
@@ -270,8 +289,27 @@ export default function Dashboard() {
 
 	// --- キーボードショートカット ---
 	const handleKeyDown = (e: KeyboardEvent) => {
-		// Escape -> モーダル / エディターを閉じる（モーダル優先）
+		// Ctrl+K / Cmd+K -> 検索パレット開閉
+		if (e.key === "k" && (e.ctrlKey || e.metaKey)) {
+			e.preventDefault();
+			if (!searchOpen()) {
+				const localName = navCtx?.findItem(params.id)?.name ?? "現在のダッシュボード";
+				const localFields = buildLocalIndex(gridRef, localName);
+				const globalFields = navCtx
+					? buildGlobalIndex(navCtx.getAllItems(), params.id, navCtx.getDocumentContent)
+					: [];
+				searchIndexCache = [...localFields, ...globalFields];
+				setSearchQuery("");
+				setSearchResults([]);
+				setSearchSelectedIdx(0);
+			}
+			setSearchOpen(!searchOpen());
+			return;
+		}
+
+		// Escape -> モーダル / エディターを閉じる（検索パレット最優先）
 		if (e.key === "Escape") {
+			if (searchOpen()) { e.preventDefault(); setSearchOpen(false); return; }
 			if (templateModalOpen()) { e.preventDefault(); setTemplateModalOpen(false); return; }
 			if (chatHistoryOpen()) { e.preventDefault(); setChatHistoryOpen(false); return; }
 			if (providerModalOpen()) { e.preventDefault(); setProviderModalOpen(false); return; }
@@ -326,7 +364,59 @@ export default function Dashboard() {
 	onCleanup(() => {
 		document.removeEventListener("keydown", handleKeyDown);
 		document.removeEventListener("keyup", handleKeyUp);
+		if (searchDebounceTimer !== undefined) clearTimeout(searchDebounceTimer);
 	});
+
+	// --- 検索パレット ---
+	const handleSearchInput = (value: string) => {
+		setSearchQuery(value);
+		setSearchSelectedIdx(0);
+		if (searchDebounceTimer !== undefined) clearTimeout(searchDebounceTimer);
+		if (!value.trim()) {
+			setSearchResults([]);
+			return;
+		}
+		searchDebounceTimer = setTimeout(() => {
+			setSearchResults(searchIndex(searchIndexCache, value));
+		}, 250);
+	};
+
+	const handleSearchKeyDown = (e: KeyboardEvent) => {
+		const results = searchResults();
+		if (e.key === "ArrowDown") {
+			e.preventDefault();
+			setSearchSelectedIdx((i) => Math.min(i + 1, results.length - 1));
+		} else if (e.key === "ArrowUp") {
+			e.preventDefault();
+			setSearchSelectedIdx((i) => Math.max(i - 1, 0));
+		} else if (e.key === "Enter" && results.length > 0) {
+			e.preventDefault();
+			const selected = results[searchSelectedIdx()];
+			if (selected) handleSearchSelect(selected);
+		}
+	};
+
+	const handleSearchSelect = (result: SearchResult) => {
+		setSearchOpen(false);
+		if (result.dashboardId === null) {
+			// 現在のダッシュボード内 → スクロール＆ハイライト
+			scrollToAndHighlight(gridRef, result.widgetId);
+		} else if (result.widgetType === "document") {
+			navigate(`/document/${result.dashboardId}`);
+		} else {
+			// 他ダッシュボードへ遷移（ハイライト対象ウィジェットIDをクエリパラメータで渡す）
+			navigate(`/dashboard/${result.dashboardId}?highlight=${result.widgetId}`);
+		}
+	};
+
+	const WIDGET_TYPE_ICONS: Record<WidgetType | "document", typeof FileTextIcon> = {
+		text: FileTextIcon,
+		visual: BarChart3Icon,
+		ai: BotIcon,
+		object: BoxIcon,
+		folder: FolderIcon,
+		document: FileTextIcon,
+	};
 
 	const itemName = () => {
 		const item = navCtx?.findItem(params.id);
@@ -1223,6 +1313,14 @@ export default function Dashboard() {
 
 				// 保存済みダイアグラムを描画
 				renderDiagramsInGrid(gridRef);
+
+				// 検索結果からの遷移時: クエリパラメータのウィジェットをハイライト
+				const highlightId = Number(searchParams.highlight);
+				if (!Number.isNaN(highlightId) && highlightId > 0) {
+					setSearchParams({ highlight: undefined });
+					// DOMレンダリング完了を待ってからスクロール＆ハイライト
+					setTimeout(() => scrollToAndHighlight(gridRef, highlightId), 300);
+				}
 
 				const autoSave = () => saveLayout(g, id);
 				g.on("change", () => {
@@ -2678,6 +2776,74 @@ export default function Dashboard() {
 									</div>
 								)}
 							</For>
+						</Show>
+					</div>
+				</div>
+			</Show>
+
+			{/* === 検索パレット (Ctrl+K) === */}
+			<Show when={searchOpen()}>
+				{/* biome-ignore lint/a11y/useKeyWithClickEvents: search backdrop */}
+				{/* biome-ignore lint/a11y/useSemanticElements: search backdrop */}
+				<div
+					class="search-palette-backdrop"
+					role="button"
+					tabIndex={-1}
+					onClick={() => setSearchOpen(false)}
+				>
+					<div
+						class="search-palette"
+						role="dialog"
+						onClick={(e) => e.stopPropagation()}
+						onKeyDown={(e) => e.stopPropagation()}
+					>
+						<div class="search-palette-input-row">
+							<SearchIcon size={18} class="search-palette-icon" />
+							<input
+								ref={(el) => setTimeout(() => el.focus(), 0)}
+								type="text"
+								class="search-palette-input"
+								placeholder="全ダッシュボード・ドキュメントを検索... (Ctrl+K)"
+								value={searchQuery()}
+								onInput={(e) => handleSearchInput(e.currentTarget.value)}
+								onKeyDown={handleSearchKeyDown}
+							/>
+							<kbd class="search-palette-kbd">Esc</kbd>
+						</div>
+						<Show when={searchResults().length > 0}>
+							<div class="search-palette-results">
+								<For each={searchResults()}>
+									{(result, idx) => {
+										const Icon = WIDGET_TYPE_ICONS[result.widgetType] ?? FileTextIcon;
+										return (
+											<button
+												type="button"
+												class="search-palette-result"
+												classList={{ "search-palette-result-selected": idx() === searchSelectedIdx() }}
+												onClick={() => handleSearchSelect(result)}
+												onMouseEnter={() => setSearchSelectedIdx(idx())}
+											>
+												<Icon size={16} class="search-palette-result-icon" />
+												<div class="search-palette-result-body">
+													<Show when={result.dashboardId !== null}>
+														<div class="search-palette-result-location">{result.dashboardName}</div>
+													</Show>
+													<div class="search-palette-result-title">
+														<span>{result.widgetType === "document" ? result.title : `#${result.widgetId} ${result.title}`}</span>
+														<span class="search-palette-result-field">{result.fieldName}</span>
+													</div>
+													<div class="search-palette-result-snippet">{result.matchSnippet}</div>
+												</div>
+											</button>
+										);
+									}}
+								</For>
+							</div>
+						</Show>
+						<Show when={searchQuery().trim() !== "" && searchResults().length === 0}>
+							<div class="search-palette-empty">
+								一致する結果が見つかりません
+							</div>
 						</Show>
 					</div>
 				</div>

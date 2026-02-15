@@ -32,6 +32,7 @@ import "./App.css";
 // NavItemsContext: allows child pages to look up nav items by id
 export interface NavItemsContextValue {
 	findItem: (id: string) => NavItem | undefined;
+	getAllItems: () => NavItem[];
 	getDocumentContent: (id: string) => string;
 	setDocumentContent: (id: string, content: string) => void;
 	saveNow: () => Promise<void>;
@@ -349,6 +350,7 @@ function App(props: ParentProps) {
 
 	const navItemsCtx: NavItemsContextValue = {
 		findItem: (id: string) => navItems().find((item) => item.id === id),
+		getAllItems: () => navItems(),
 		getDocumentContent: (id: string) => documents()[id] ?? "",
 		setDocumentContent: (id: string, content: string) => {
 			setDocuments((prev) => ({ ...prev, [id]: content }));
