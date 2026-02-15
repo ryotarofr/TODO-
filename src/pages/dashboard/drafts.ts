@@ -17,3 +17,7 @@ export function saveDrafts(drafts: PanelDraft[]) {
 export function storageKey(id: string): string {
 	return `dashboard-layout-${id}`;
 }
+
+export function pipelineStorageKey(id: string): string {
+	return `dashboard-pipeline-${id}`;
+}

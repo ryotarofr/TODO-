@@ -1,6 +1,19 @@
 import type { GridStack } from "gridstack";
 import type { EventEnvelope } from "../../utils/agent";
+import { executeAgent } from "../../utils/agent";
+import {
+	buildAugmentedPrompt,
+	collectUpstreamOutputs,
+	getPanelOutput,
+} from "./pipelineEngine";
+import type { PipelineEdge } from "./types";
 import { escapeHtml, makeAiContent } from "./widgetContent";
+
+export interface WsEventContext {
+	getPipelineEdges: () => PipelineEdge[];
+	getPanelOutputs: () => Record<number, string>;
+	setPanelOutput: (widgetId: number, output: string) => void;
+}
 
 /**
  * WebSocket実行イベントを処理し、グリッド内のDOM要素を更新する。
@@ -12,6 +25,7 @@ export function handleWsEvent(
 	widgetCount: () => number,
 	setWidgetCount: (v: number) => void,
 	refreshConnections: () => void,
+	wsCtx?: WsEventContext,
 ): void {
 	const evt = event.event;
 	if (evt.type === "AgentExecutionStarted") {
@@ -43,6 +57,13 @@ export function handleWsEvent(
 				}
 				const outEl = gridRef?.querySelector(`[data-output-id="${wid}"]`);
 				if (outEl) outEl.textContent = evt.output;
+
+				// 出力をキャッシュ + auto-chainトリガー
+				const widNum = Number(wid);
+				if (wsCtx && !Number.isNaN(widNum)) {
+					wsCtx.setPanelOutput(widNum, evt.output);
+					triggerAutoChain(widNum, gridRef, wsCtx);
+				}
 			}
 		}
 	} else if (evt.type === "AgentExecutionFailed") {
@@ -62,7 +83,7 @@ export function handleWsEvent(
 			}
 		}
 	} else if (evt.type === "SubAgentCreated") {
-		// 新しいサブエージェントパネルを動的に追加
+		// Step 1: 新しいサブエージェントパネルを動的に追加
 		const newCount = widgetCount() + 1;
 		setWidgetCount(newCount);
 		const content = makeAiContent(
@@ -74,14 +95,39 @@ export function handleWsEvent(
 			evt.agent_id,
 			"none",
 		);
-		grid.addWidget({ w: 16, h: 8, content });
-		refreshConnections();
+		const newEl = grid.addWidget({ w: 16, h: 8, content });
 
-		// オーケストレーターパネルにもサブエージェントバッジを追加
+		// Step 2: オーケストレーターパネルのリンク更新
 		const orchRoot = gridRef?.querySelector(
 			`[data-ai-agent-id="${evt.orchestrator_agent_id}"]`,
 		);
 		if (orchRoot) {
+			// data-ai-linked属性に新パネルIDを追加
+			const currentLinked = orchRoot.getAttribute("data-ai-linked") || "";
+			const linkedIds = currentLinked
+				? currentLinked.split(",").filter(Boolean)
+				: [];
+			linkedIds.push(String(newCount));
+			orchRoot.setAttribute("data-ai-linked", linkedIds.join(","));
+
+			// .ai-linked-labelを更新（存在しなければ新規作成）
+			const aiContent = orchRoot.querySelector(".ai-widget-content");
+			let linkedLabel = orchRoot.querySelector(".ai-linked-label");
+			if (!linkedLabel && aiContent) {
+				linkedLabel = document.createElement("div");
+				linkedLabel.className = "ai-linked-label";
+				const promptPreview = aiContent.querySelector(".ai-prompt-preview");
+				if (promptPreview) {
+					promptPreview.after(linkedLabel);
+				} else {
+					aiContent.prepend(linkedLabel);
+				}
+			}
+			if (linkedLabel) {
+				linkedLabel.textContent = `連携: ${linkedIds.map((x) => `#${x}`).join(", ")}`;
+			}
+
+			// Step 3: サブエージェントバッジ追加
 			const wid = orchRoot.getAttribute("data-widget-id");
 			const subArea = gridRef?.querySelector(`[data-sub-agents-id="${wid}"]`);
 			if (subArea) {
@@ -92,6 +138,24 @@ export function handleWsEvent(
 				subArea.appendChild(badge);
 			}
 		}
+
+		// Step 4: 新パネルに視覚効果を付与
+		if (newEl) {
+			newEl.classList.add("gs-item-spawned");
+			setTimeout(() => newEl.classList.remove("gs-item-spawned"), 1500);
+
+			// ヘッダーに「自動生成」バッジを挿入
+			const headerActions = newEl.querySelector(".widget-header-actions");
+			if (headerActions) {
+				const tag = document.createElement("span");
+				tag.className = "ai-auto-created-tag";
+				tag.textContent = "自動生成";
+				headerActions.prepend(tag);
+			}
+		}
+
+		// Step 5: 接続線を再計算
+		refreshConnections();
 	} else if (evt.type === "OrchestratorPlanProposed") {
 		// オーケストレーターパネルにプランを表示
 		const orchRoot = gridRef?.querySelector(
@@ -142,6 +206,13 @@ export function handleWsEvent(
 				}
 				const outEl = gridRef?.querySelector(`[data-output-id="${wid}"]`);
 				if (outEl) outEl.textContent = evt.output;
+
+				// 出力をキャッシュ + auto-chainトリガー
+				const widNum = Number(wid);
+				if (wsCtx && !Number.isNaN(widNum)) {
+					wsCtx.setPanelOutput(widNum, evt.output);
+					triggerAutoChain(widNum, gridRef, wsCtx);
+				}
 			}
 		}
 	} else if (evt.type === "OrchestratorFailed") {
@@ -160,5 +231,92 @@ export function handleWsEvent(
 				if (outEl) outEl.textContent = evt.error;
 			}
 		}
+	}
+}
+
+/**
+ * auto-chain: source完了後にdownstreamのautoChainエッジを探し、
+ * 全upstreamが完了済みなら自動実行をトリガー
+ */
+function triggerAutoChain(
+	completedWidgetId: number,
+	gridRef: HTMLDivElement,
+	ctx: WsEventContext,
+): void {
+	const edges = ctx.getPipelineEdges();
+	const outputs = ctx.getPanelOutputs();
+
+	// completedWidgetIdがsourceであるautoChainエッジを検索
+	const downstreamEdges = edges.filter(
+		(e) => e.sourceWidgetId === completedWidgetId && e.autoChain,
+	);
+
+	for (const edge of downstreamEdges) {
+		const targetId = edge.targetWidgetId;
+
+		// target全upstreamが完了済みか確認
+		const allUpstreamEdges = edges.filter((e) => e.targetWidgetId === targetId);
+		const allReady = allUpstreamEdges.every((e) => {
+			const srcOutput = outputs[e.sourceWidgetId];
+			if (srcOutput !== undefined && srcOutput !== "") return true;
+			// DOMから最新を取得
+			const freshOutput = getPanelOutput(e.sourceWidgetId, gridRef);
+			if (freshOutput) {
+				ctx.setPanelOutput(e.sourceWidgetId, freshOutput);
+				return true;
+			}
+			return false;
+		});
+
+		if (!allReady) continue;
+
+		// targetがAIパネルの場合のみ自動実行
+		const targetRoot = gridRef.querySelector(
+			`[data-widget-id="${targetId}"][data-widget-type="ai"]`,
+		);
+		if (!targetRoot) continue;
+
+		const prompt = targetRoot.getAttribute("data-ai-prompt") ?? "";
+		const agentId = targetRoot.getAttribute("data-ai-agent-id") ?? "";
+		if (!agentId || !prompt) continue;
+
+		// upstream出力を収集してプロンプトに注入
+		const freshOutputs = ctx.getPanelOutputs();
+		const upstream = collectUpstreamOutputs(targetId, edges, freshOutputs).map(
+			(u) => {
+				const srcRoot = gridRef.querySelector(
+					`[data-widget-id="${u.widgetId}"]`,
+				);
+				const type = srcRoot?.getAttribute("data-widget-type") ?? "unknown";
+				const typeLabels: Record<string, string> = {
+					text: "テキスト Widget",
+					visual: "ビジュアル Widget",
+					ai: "AI連携 Widget",
+					object: "オブジェクト Widget",
+					folder: "フォルダ Widget",
+				};
+				return { ...u, label: typeLabels[type] ?? "Widget" };
+			},
+		);
+		const augmentedPrompt = buildAugmentedPrompt(prompt, upstream);
+
+		// バッジを更新して実行開始
+		const badge = gridRef.querySelector(`[data-status-id="${targetId}"]`);
+		if (badge) {
+			badge.className = "ai-status-badge ai-status-running";
+			badge.textContent = "自動実行中...";
+		}
+		const outEl = gridRef.querySelector(`[data-output-id="${targetId}"]`);
+		if (outEl) outEl.textContent = "";
+
+		executeAgent(agentId, augmentedPrompt).catch((err) => {
+			const badgeEl = gridRef.querySelector(`[data-status-id="${targetId}"]`);
+			if (badgeEl) {
+				badgeEl.className = "ai-status-badge ai-status-failed";
+				badgeEl.textContent = "エラー";
+			}
+			const errorEl = gridRef.querySelector(`[data-output-id="${targetId}"]`);
+			if (errorEl) errorEl.textContent = String(err);
+		});
 	}
 }

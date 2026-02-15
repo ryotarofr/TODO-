@@ -1,4 +1,4 @@
-import type { Connection, Direction } from "./types";
+import type { Connection, Direction, PipelineEdge } from "./types";
 
 export function controlOffset(distance: number, curvature = 0.25): number {
 	return distance >= 0 ? 0.5 * distance : curvature * 25 * Math.sqrt(-distance);
@@ -114,6 +114,84 @@ export function computeConnections(gridRef: HTMLDivElement): Connection[] {
 				color,
 			});
 		}
+	}
+	return result;
+}
+
+/**
+ * PipelineEdge[]から有向接続線を計算。
+ * sourceは出力ポート（右側）から、targetは入力ポート（左側）へ接続。
+ */
+export function computeDirectedConnections(
+	gridRef: HTMLDivElement,
+	edges: PipelineEdge[],
+): Connection[] {
+	const area = gridRef.parentElement;
+	if (!area) return [];
+	const origin = area.getBoundingClientRect();
+	const result: Connection[] = [];
+
+	for (const edge of edges) {
+		const sourceRoot = gridRef.querySelector(
+			`[data-widget-id="${edge.sourceWidgetId}"]`,
+		);
+		const targetRoot = gridRef.querySelector(
+			`[data-widget-id="${edge.targetWidgetId}"]`,
+		);
+		if (!sourceRoot || !targetRoot) continue;
+
+		const sourceItem = (sourceRoot as HTMLElement).closest(
+			".grid-stack-item",
+		) as HTMLElement | null;
+		const targetItem = (targetRoot as HTMLElement).closest(
+			".grid-stack-item",
+		) as HTMLElement | null;
+		if (!sourceItem || !targetItem) continue;
+
+		const sRect = contentRect(sourceItem, origin);
+		const tRect = contentRect(targetItem, origin);
+
+		// ポート位置: source右側中央、target左側中央
+		const sourcePort = {
+			x: sRect.l + sRect.w,
+			y: sRect.t + sRect.h / 2,
+			dir: "right" as Direction,
+		};
+		const targetPort = {
+			x: tRect.l,
+			y: tRect.t + tRect.h / 2,
+			dir: "left" as Direction,
+		};
+
+		// sourceが右にない場合はスマートアンカーにフォールバック
+		const dx = tRect.l - (sRect.l + sRect.w);
+		let from: { x: number; y: number; dir: Direction };
+		let to: { x: number; y: number; dir: Direction };
+
+		if (dx >= -20) {
+			// 標準: 右→左
+			from = sourcePort;
+			to = targetPort;
+		} else {
+			// targetがsourceの左にある: スマートアンカー使用
+			from = exitAnchor(sRect, tRect);
+			to = exitAnchor(tRect, sRect);
+		}
+
+		const headerEl = sourceRoot.querySelector(".widget-header") as HTMLElement;
+		const color = headerEl?.style.color ?? "#6a1b9a";
+
+		result.push({
+			fromX: from.x,
+			fromY: from.y,
+			fromDir: from.dir,
+			toX: to.x,
+			toY: to.y,
+			toDir: to.dir,
+			color,
+			edgeId: edge.id,
+			isAutoChain: edge.autoChain,
+		});
 	}
 	return result;
 }

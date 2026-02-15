@@ -5,9 +5,26 @@ import {
 	orchestrateAgent,
 	rejectOrchestration,
 } from "../../utils/agent";
+import {
+	buildFolderOutput,
+	buildTreeHtml,
+	DEFAULT_EXCLUDE_PATTERNS,
+	openFolderPicker,
+	readDirRecursive,
+	readFolderContents,
+} from "./folderReader";
+import {
+	buildAugmentedPrompt,
+	collectUpstreamOutputs,
+	getPanelOutput,
+} from "./pipelineEngine";
+import type { PipelineEdge } from "./types";
 
 export interface GridEventHandlers {
 	handleEditWidget: (widgetId: number) => void;
+	getPipelineEdges: () => PipelineEdge[];
+	getPanelOutputs: () => Record<number, string>;
+	setPanelOutput: (widgetId: number, output: string) => void;
 }
 
 /**
@@ -31,7 +48,7 @@ export function setupGridEventDelegation(
 				"[data-action='ai-execute']",
 			) as HTMLElement | null;
 			if (execBtn) {
-				handleAiExecute(execBtn, gridRef, e);
+				handleAiExecute(execBtn, gridRef, e, handlers);
 				return;
 			}
 
@@ -59,6 +76,15 @@ export function setupGridEventDelegation(
 			) as HTMLElement | null;
 			if (rejectBtn) {
 				handleReject(rejectBtn, gridRef, e);
+				return;
+			}
+
+			// 0e. フォルダ読み込みボタン
+			const folderBtn = target.closest(
+				"[data-action='folder-load']",
+			) as HTMLElement | null;
+			if (folderBtn) {
+				handleFolderLoad(folderBtn, gridRef, e, handlers);
 				return;
 			}
 
@@ -125,6 +151,7 @@ function handleAiExecute(
 	execBtn: HTMLElement,
 	gridRef: HTMLDivElement,
 	e: MouseEvent,
+	handlers: GridEventHandlers,
 ) {
 	const wid = Number(execBtn.getAttribute("data-widget-id"));
 	if (!Number.isNaN(wid) && wid > 0) {
@@ -147,6 +174,65 @@ function handleAiExecute(
 			return;
 		}
 		if (prompt) {
+			// upstream出力を収集してプロンプトに注入
+			const edges = handlers.getPipelineEdges();
+			const currentOutputs = handlers.getPanelOutputs();
+
+			// pipelineEdges + aiLinkedPanels を統合してupstreamを収集
+			const pipelineSourceIds = new Set(
+				edges
+					.filter((edge) => edge.targetWidgetId === wid)
+					.map((edge) => edge.sourceWidgetId),
+			);
+			const linkedStr = aiRoot?.getAttribute("data-ai-linked") ?? "";
+			const linkedIds = linkedStr
+				? linkedStr
+						.split(",")
+						.map(Number)
+						.filter((n) => !Number.isNaN(n) && n > 0)
+				: [];
+			const mergedEdges: PipelineEdge[] = [...edges];
+			for (const linkedId of linkedIds) {
+				if (!pipelineSourceIds.has(linkedId)) {
+					mergedEdges.push({
+						id: `linked-${linkedId}-${wid}`,
+						sourceWidgetId: linkedId,
+						targetWidgetId: wid,
+						autoChain: false,
+					});
+				}
+			}
+
+			// upstreamパネルの最新出力をDOMから再取得
+			const freshOutputs = { ...currentOutputs };
+			for (const edge of mergedEdges) {
+				if (edge.targetWidgetId === wid) {
+					const srcOutput = getPanelOutput(edge.sourceWidgetId, gridRef);
+					if (srcOutput) {
+						freshOutputs[edge.sourceWidgetId] = srcOutput;
+						handlers.setPanelOutput(edge.sourceWidgetId, srcOutput);
+					}
+				}
+			}
+
+			const upstream = collectUpstreamOutputs(wid, mergedEdges, freshOutputs).map(
+				(u) => {
+					const srcRoot = gridRef.querySelector(
+						`[data-widget-id="${u.widgetId}"]`,
+					);
+					const type = srcRoot?.getAttribute("data-widget-type") ?? "unknown";
+					const typeLabels: Record<string, string> = {
+						text: "テキスト Widget",
+						visual: "ビジュアル Widget",
+						ai: "AI連携 Widget",
+						object: "オブジェクト Widget",
+						folder: "フォルダ Widget",
+					};
+					return { ...u, label: typeLabels[type] ?? "Widget" };
+				},
+			);
+			const augmentedPrompt = buildAugmentedPrompt(prompt, upstream);
+
 			// ステータスバッジを更新
 			const badge = gridRef.querySelector(`[data-status-id="${wid}"]`);
 			if (badge) {
@@ -156,7 +242,7 @@ function handleAiExecute(
 			const outputArea = gridRef.querySelector(`[data-output-id="${wid}"]`);
 			if (outputArea) outputArea.textContent = "";
 
-			executeAgent(agentId, prompt)
+			executeAgent(agentId, augmentedPrompt)
 				.then((execution) => {
 					const badgeEl = gridRef.querySelector(`[data-status-id="${wid}"]`);
 					const outEl = gridRef.querySelector(`[data-output-id="${wid}"]`);
@@ -165,7 +251,10 @@ function handleAiExecute(
 							badgeEl.className = "ai-status-badge ai-status-completed";
 							badgeEl.textContent = "完了";
 						}
-						if (outEl) outEl.textContent = execution.output_text ?? "";
+						const outputText = execution.output_text ?? "";
+						if (outEl) outEl.textContent = outputText;
+						// 出力をキャッシュ
+						handlers.setPanelOutput(wid, outputText);
 					} else {
 						if (badgeEl) {
 							badgeEl.className = "ai-status-badge ai-status-failed";
@@ -275,6 +364,86 @@ function handleApprove(
 		}
 	}
 	e.stopPropagation();
+}
+
+async function handleFolderLoad(
+	folderBtn: HTMLElement,
+	gridRef: HTMLDivElement,
+	e: MouseEvent,
+	handlers: GridEventHandlers,
+) {
+	const wid = Number(folderBtn.getAttribute("data-widget-id"));
+	if (Number.isNaN(wid) || wid <= 0) return;
+	e.stopPropagation();
+
+	const folderRoot = gridRef.querySelector(
+		`[data-widget-id="${wid}"][data-widget-type="folder"]`,
+	);
+	if (!folderRoot) return;
+
+	let folderPath = folderRoot.getAttribute("data-folder-path") ?? "";
+	const maxDepth = Number(
+		folderRoot.getAttribute("data-folder-max-depth") ?? "3",
+	);
+	const excludeStr = folderRoot.getAttribute("data-folder-exclude") ?? "";
+	const excludePatterns =
+		excludeStr.trim().length > 0
+			? excludeStr.split("\n").filter((s) => s.trim().length > 0)
+			: DEFAULT_EXCLUDE_PATTERNS;
+
+	// パスが空の場合はフォルダ選択ダイアログを開く
+	if (!folderPath) {
+		const picked = await openFolderPicker();
+		if (!picked) return;
+		folderPath = picked;
+		folderRoot.setAttribute("data-folder-path", folderPath);
+		// パスラベルを更新
+		const pathLabel = folderRoot.querySelector(".folder-path-label");
+		if (pathLabel) pathLabel.textContent = folderPath;
+	}
+
+	// 読み込みボタンをローディング表示に
+	const btn = folderBtn as HTMLButtonElement;
+	const originalText = btn.textContent;
+	btn.textContent = "読み込み中...";
+	btn.disabled = true;
+
+	try {
+		const entries = await readDirRecursive(folderPath, {
+			maxDepth,
+			excludePatterns,
+			maxFiles: 200,
+		});
+
+		// ツリーHTMLを生成して挿入
+		const treeHtml = buildTreeHtml(entries);
+		const treeArea = gridRef.querySelector(`[data-folder-tree-id="${wid}"]`);
+		if (treeArea) treeArea.innerHTML = treeHtml;
+
+		// ファイル内容を読み込み
+		const contents = await readFolderContents(entries);
+		console.log(
+			`[dashboard] folder #${wid}: ${contents.length} file contents loaded`,
+		);
+
+		// パイプライン用出力テキストを生成してキャッシュ
+		const outputText = buildFolderOutput(folderPath, entries, contents);
+		console.log(
+			`[dashboard] folder #${wid}: output text length = ${outputText.length}`,
+		);
+		const outEl = gridRef.querySelector(`[data-output-id="${wid}"]`);
+		if (outEl) outEl.textContent = outputText;
+
+		// パイプライン用出力を登録
+		handlers.setPanelOutput(wid, outputText);
+	} catch (err) {
+		const treeArea = gridRef.querySelector(`[data-folder-tree-id="${wid}"]`);
+		if (treeArea)
+			treeArea.innerHTML = `<div class="folder-error">読み込みエラー: ${String(err)}</div>`;
+	} finally {
+		btn.textContent = originalText;
+		btn.disabled = false;
+	}
 }
 
 function handleReject(

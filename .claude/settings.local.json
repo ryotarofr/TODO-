@@ -34,7 +34,12 @@
       "Bash(git checkout:*)",
       "Bash(dir:*)",
       "Bash(where:*)",
-      "Bash(wc:*)"
+      "Bash(wc:*)",
+      "Bash(npx lucide-solid:*)",
+      "Bash(python:*)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(bun -e:*)",
+      "WebFetch(domain:eden.so)"
     ]
   }
 }

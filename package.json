@@ -27,6 +27,7 @@
 		"@thisbeyond/solid-dnd": "^0.7.5",
 		"gridstack": "^12.4.2",
 		"lucide-solid": "^0.563.0",
+		"mermaid": "^11.12.2",
 		"solid-js": "^1.9.3"
 	},
 	"devDependencies": {

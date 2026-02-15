@@ -8,12 +8,16 @@ import {
 	BoxIcon,
 	CheckIcon,
 	FileTextIcon,
+	FolderIcon,
 	FolderOpenIcon,
 	MinusIcon,
 	MoveHorizontalIcon,
 	MoveVerticalIcon,
+	PlayIcon,
 	PlusIcon,
 	SaveIcon,
+	Share2Icon,
+	SquareIcon,
 	TableIcon,
 	Trash2Icon,
 	XIcon,
@@ -34,7 +38,12 @@ import PlainTextEditor from "../components/lexical/components/PlainTextEditor";
 import RichTextEditor from "../components/lexical/components/RichTextEditor";
 import { useAuth } from "../contexts/AuthContext";
 import type { EventEnvelope, LlmProvider } from "../utils/agent";
-import { createAgent, createWorkflow, getLlmProviders } from "../utils/agent";
+import {
+	createAgent,
+	createWorkflow,
+	executeAgent,
+	getLlmProviders,
+} from "../utils/agent";
 import {
 	connectWebSocket,
 	disconnectWebSocket,
@@ -44,19 +53,49 @@ import "./Dashboard.css";
 
 import {
 	computeConnections,
+	computeDirectedConnections,
 	connectionPath,
 } from "./dashboard/connectionGeometry";
 import {
 	COLOR_PRESETS,
 	VISUAL_SUBTYPES,
 	WIDGET_DEFS,
+	WORKFLOW_TEMPLATES,
 } from "./dashboard/constants";
-import { loadDrafts, saveDrafts, storageKey } from "./dashboard/drafts";
+import {
+	loadDrafts,
+	pipelineStorageKey,
+	saveDrafts,
+	storageKey,
+} from "./dashboard/drafts";
+import {
+	buildFolderOutput,
+	buildTreeHtml,
+	DEFAULT_EXCLUDE_PATTERNS,
+	openFolderPicker,
+	readDirRecursive,
+	readFolderContents,
+} from "./dashboard/folderReader";
 import { setupGridEventDelegation } from "./dashboard/gridEventDelegation";
+import {
+	DEFAULT_ER_DIAGRAM,
+	extractMermaidCode,
+	renderDiagramsInGrid,
+} from "./dashboard/mermaidRenderer";
+import {
+	buildAugmentedPrompt,
+	collectUpstreamOutputs,
+	executePipeline,
+	getPanelOutput,
+	type PipelineCallbacks,
+} from "./dashboard/pipelineEngine";
+import { setupPortDragHandler } from "./dashboard/portDragHandler";
 import type {
 	Connection,
 	PanelConfig,
 	PanelDraft,
+	PipelineEdge,
+	PipelineStatus,
 	VisualSubType,
 	WidgetType,
 } from "./dashboard/types";
@@ -74,6 +113,7 @@ export default function Dashboard() {
 	const navCtx = useContext(NavItemsContext);
 	const auth = useAuth();
 	let gridRef!: HTMLDivElement;
+	let svgRef!: SVGSVGElement;
 	const [grid, setGrid] = createSignal<GridStack | null>(null);
 	const [widgetCount, setWidgetCount] = createSignal(0);
 	const [llmProviders, setLlmProviders] = createSignal<LlmProvider[]>([]);
@@ -107,9 +147,41 @@ export default function Dashboard() {
 	const [dragging, setDragging] = createSignal(false);
 	const [animKey, setAnimKey] = createSignal(0);
 
+	// パイプライン
+	const [pipelineEdges, setPipelineEdges] = createSignal<PipelineEdge[]>([]);
+	const [pipelineStatus, setPipelineStatus] =
+		createSignal<PipelineStatus>("idle");
+	const [panelOutputs, setPanelOutputs] = createSignal<Record<number, string>>(
+		{},
+	);
+	const [currentPipelineStep, setCurrentPipelineStep] = createSignal<
+		number | null
+	>(null);
+	let pipelineAbortController: AbortController | null = null;
+
+	// テンプレート進捗
+	const [templateProgress, setTemplateProgress] = createSignal<{
+		active: boolean;
+		message: string;
+	} | null>(null);
+
+	// エッジコンテキストメニュー
+	const [edgeContextMenu, setEdgeContextMenu] = createSignal<{
+		x: number;
+		y: number;
+		edgeId: string;
+	} | null>(null);
+
 	const refreshConnections = () => {
 		if (!gridRef) return;
-		setConnections(computeConnections(gridRef));
+		const edges = pipelineEdges();
+		if (edges.length > 0) {
+			// パイプラインエッジがある場合は有向接続線を使用
+			setConnections(computeDirectedConnections(gridRef, edges));
+		} else {
+			// フォールバック: 既存のaiLinkedPanels接続
+			setConnections(computeConnections(gridRef));
+		}
 		setAnimKey((k) => k + 1);
 	};
 
@@ -129,6 +201,11 @@ export default function Dashboard() {
 				widgetCount,
 				setWidgetCount,
 				refreshConnections,
+				{
+					getPipelineEdges: () => pipelineEdges(),
+					getPanelOutputs: () => panelOutputs(),
+					setPanelOutput,
+				},
 			);
 		});
 		onCleanup(() => {
@@ -201,10 +278,346 @@ export default function Dashboard() {
 		}
 	};
 
+	const savePipelineEdges = (id: string, edges: PipelineEdge[]) => {
+		localStorage.setItem(pipelineStorageKey(id), JSON.stringify(edges));
+	};
+
+	const loadPipelineEdges = (id: string): PipelineEdge[] => {
+		try {
+			const raw = localStorage.getItem(pipelineStorageKey(id));
+			return raw ? JSON.parse(raw) : [];
+		} catch {
+			return [];
+		}
+	};
+
+	/** 既存aiLinkedPanelsからパイプラインエッジへの自動マイグレーション */
+	const migrateLinkedPanelsToEdges = (): PipelineEdge[] => {
+		const edges: PipelineEdge[] = [];
+		const seen = new Set<string>();
+		const aiPanels = gridRef.querySelectorAll('[data-widget-type="ai"]');
+		for (const aiRoot of aiPanels) {
+			const targetId = Number(aiRoot.getAttribute("data-widget-id"));
+			const linkedStr = aiRoot.getAttribute("data-ai-linked") ?? "";
+			if (!linkedStr || Number.isNaN(targetId)) continue;
+			const linkedIds = linkedStr
+				.split(",")
+				.map(Number)
+				.filter((n) => !Number.isNaN(n) && n > 0);
+			for (const sourceId of linkedIds) {
+				const edgeId = `edge-${sourceId}-${targetId}`;
+				if (!seen.has(edgeId)) {
+					seen.add(edgeId);
+					edges.push({
+						id: edgeId,
+						sourceWidgetId: sourceId,
+						targetWidgetId: targetId,
+						autoChain: false,
+					});
+				}
+			}
+		}
+		return edges;
+	};
+
+	const setPanelOutput = (widgetId: number, output: string) => {
+		setPanelOutputs((prev) => ({ ...prev, [widgetId]: output }));
+	};
+
+	const handlePipelineExecute = () => {
+		const edges = pipelineEdges();
+		if (edges.length === 0) return;
+
+		pipelineAbortController = new AbortController();
+		setPipelineStatus("running");
+
+		const callbacks: PipelineCallbacks = {
+			onStepStart: (widgetId) => {
+				setCurrentPipelineStep(widgetId);
+				const badge = gridRef.querySelector(`[data-status-id="${widgetId}"]`);
+				if (badge) {
+					badge.className = "ai-status-badge ai-status-running";
+					badge.textContent = "実行中...";
+				}
+			},
+			onStepComplete: (widgetId, output) => {
+				setPanelOutput(widgetId, output);
+			},
+			onStepFail: (widgetId, _error) => {
+				void widgetId;
+			},
+			onPipelineComplete: () => {
+				setPipelineStatus("completed");
+				setCurrentPipelineStep(null);
+				pipelineAbortController = null;
+			},
+			onPipelineFail: (_error) => {
+				setPipelineStatus("failed");
+				setCurrentPipelineStep(null);
+				pipelineAbortController = null;
+			},
+		};
+
+		executePipeline(edges, gridRef, callbacks, pipelineAbortController.signal);
+	};
+
+	const handlePipelineStop = () => {
+		if (pipelineAbortController) {
+			pipelineAbortController.abort();
+			pipelineAbortController = null;
+		}
+		setPipelineStatus("stopped");
+		setCurrentPipelineStep(null);
+	};
+
+	const addPipelineEdge = (edge: PipelineEdge) => {
+		const updated = [...pipelineEdges(), edge];
+		setPipelineEdges(updated);
+		savePipelineEdges(params.id, updated);
+		refreshConnections();
+	};
+
+	const removePipelineEdge = (edgeId: string) => {
+		const updated = pipelineEdges().filter((e) => e.id !== edgeId);
+		setPipelineEdges(updated);
+		savePipelineEdges(params.id, updated);
+		refreshConnections();
+	};
+
+	const toggleEdgeAutoChain = (edgeId: string) => {
+		const updated = pipelineEdges().map((e) =>
+			e.id === edgeId ? { ...e, autoChain: !e.autoChain } : e,
+		);
+		setPipelineEdges(updated);
+		savePipelineEdges(params.id, updated);
+		refreshConnections();
+	};
+
+	const getAllWidgetIds = (): number[] => {
+		const ids: number[] = [];
+		const roots = gridRef.querySelectorAll("[data-widget-id]");
+		for (const root of roots) {
+			const id = Number(root.getAttribute("data-widget-id"));
+			if (!Number.isNaN(id) && id > 0) ids.push(id);
+		}
+		return ids;
+	};
+
 	const openAddPanel = () => {
 		if (editorOpen()) return;
 		setPanelView("select");
 		setEditorOpen(true);
+	};
+
+	const createFromTemplate = async (templateId: string) => {
+		const tmpl = WORKFLOW_TEMPLATES.find((t) => t.id === templateId);
+		if (!tmpl) return;
+		const g = grid();
+		if (!g) return;
+
+		// LLMプロバイダー確認
+		const providers = llmProviders();
+		if (providers.length === 0) {
+			console.error("LLMプロバイダーが未設定です");
+			return;
+		}
+		const userId = auth.user()?.id;
+		if (!userId) return;
+
+		setTemplateProgress({ active: true, message: "フォルダを選択..." });
+
+		// フォルダ選択
+		const folderPath = await openFolderPicker();
+		if (!folderPath) {
+			setTemplateProgress(null);
+			return;
+		}
+
+		try {
+			// パネル作成
+			setTemplateProgress({ active: true, message: "パネルを配置中..." });
+			const createdWidgetIds: number[] = [];
+
+			for (const panelDef of tmpl.panels) {
+				const newId = widgetCount() + 1;
+				setWidgetCount(newId);
+
+				const cfg = defaultConfigFor(panelDef.type);
+				cfg.title = panelDef.title;
+				cfg.color = panelDef.color;
+				cfg.w = panelDef.w;
+				cfg.h = panelDef.h;
+
+				if (panelDef.visualSubType) cfg.visualSubType = panelDef.visualSubType;
+				if (panelDef.diagramCode !== undefined) cfg.diagramCode = panelDef.diagramCode;
+				if (panelDef.needsFolderPath) cfg.folderPath = folderPath;
+				if (panelDef.aiPrompt) cfg.aiPrompt = panelDef.aiPrompt;
+				if (panelDef.aiSystemPrompt) cfg.aiSystemPrompt = panelDef.aiSystemPrompt;
+				if (panelDef.aiMaxTokens) cfg.aiMaxTokens = panelDef.aiMaxTokens;
+
+				// AIパネル用にエージェント自動作成
+				if (panelDef.needsAgent) {
+					const workflow = await createWorkflow(userId, panelDef.title);
+					const agent = await createAgent({
+						workflow_id: workflow.id,
+						llm_provider_id: providers[0].id,
+						name: panelDef.title,
+						system_prompt: panelDef.aiSystemPrompt || undefined,
+						model: cfg.aiModel,
+						temperature: cfg.aiTemperature,
+						max_tokens: panelDef.aiMaxTokens ?? cfg.aiMaxTokens,
+					});
+					cfg.aiAgentId = agent.id;
+				}
+
+				g.addWidget({
+					w: cfg.w,
+					h: cfg.h,
+					content: makeWidgetContent(cfg.type, newId, cfg.title, cfg.color, cfg),
+				});
+				createdWidgetIds.push(newId);
+			}
+
+			// エッジ作成
+			for (const edgeDef of tmpl.edges) {
+				const sourceId = createdWidgetIds[edgeDef.sourceIndex];
+				const targetId = createdWidgetIds[edgeDef.targetIndex];
+				addPipelineEdge({
+					id: `edge-${sourceId}-${targetId}`,
+					sourceWidgetId: sourceId,
+					targetWidgetId: targetId,
+					autoChain: true,
+				});
+			}
+
+			// フォルダ読み込み
+			setTemplateProgress({ active: true, message: "フォルダを読み込み中..." });
+			const folderWidgetId = createdWidgetIds[
+				tmpl.panels.findIndex((p) => p.needsFolderPath)
+			];
+			const excludePatterns = DEFAULT_EXCLUDE_PATTERNS;
+			const entries = await readDirRecursive(folderPath, {
+				maxDepth: 3,
+				excludePatterns,
+				maxFiles: 500,
+			});
+			const treeHtml = buildTreeHtml(entries);
+			const treeArea = gridRef.querySelector(
+				`[data-folder-tree-id="${folderWidgetId}"]`,
+			);
+			if (treeArea) treeArea.innerHTML = treeHtml;
+
+			const contents = await readFolderContents(entries);
+			const folderOutput = buildFolderOutput(folderPath, entries, contents);
+			setPanelOutput(folderWidgetId, folderOutput);
+
+			// DOM上のフォルダ出力キャッシュにも反映
+			const folderOutEl = gridRef.querySelector(
+				`[data-output-id="${folderWidgetId}"]`,
+			);
+			if (folderOutEl) folderOutEl.textContent = folderOutput;
+
+			// AIパネル実行
+			const aiPanelIndices = tmpl.panels
+				.map((p, i) => (p.needsAgent ? i : -1))
+				.filter((i) => i >= 0);
+
+			for (const aiIdx of aiPanelIndices) {
+				const aiWidgetId = createdWidgetIds[aiIdx];
+				const aiDef = tmpl.panels[aiIdx];
+				setTemplateProgress({ active: true, message: "AIを実行中..." });
+
+				// upstream出力を収集
+				const currentOutputs: Record<number, string> = {};
+				for (const [idx, wid] of createdWidgetIds.entries()) {
+					if (idx === aiIdx) continue;
+					const output = getPanelOutput(wid, gridRef);
+					if (output) currentOutputs[wid] = output;
+				}
+				const upstream = collectUpstreamOutputs(
+					aiWidgetId,
+					pipelineEdges(),
+					currentOutputs,
+				);
+				const augmentedPrompt = buildAugmentedPrompt(
+					aiDef.aiPrompt ?? "",
+					upstream,
+				);
+
+				// ステータスバッジ更新
+				const badge = gridRef.querySelector(
+					`[data-status-id="${aiWidgetId}"]`,
+				);
+				if (badge) {
+					badge.className = "ai-status-badge ai-status-running";
+					badge.textContent = "実行中...";
+				}
+
+				const agentId =
+					gridRef
+						.querySelector(`[data-widget-id="${aiWidgetId}"]`)
+						?.getAttribute("data-ai-agent-id") ?? "";
+
+				const execution = await executeAgent(agentId, augmentedPrompt);
+
+				if (execution.status === "completed") {
+					const output = execution.output_text ?? "";
+					setPanelOutput(aiWidgetId, output);
+
+					const outEl = gridRef.querySelector(
+						`[data-output-id="${aiWidgetId}"]`,
+					);
+					if (outEl) outEl.textContent = output;
+					if (badge) {
+						badge.className = "ai-status-badge ai-status-completed";
+						badge.textContent = "完了";
+					}
+
+					// ER図テンプレート: AI出力からMermaidコードを抽出してダイアグラムパネルに反映
+					const diagramIdx = tmpl.panels.findIndex(
+						(p) => p.type === "visual" && p.visualSubType === "diagram",
+					);
+					if (diagramIdx >= 0) {
+						const diagramWidgetId = createdWidgetIds[diagramIdx];
+						const mermaidCode = extractMermaidCode(output);
+						const diagramRoot = gridRef.querySelector(
+							`[data-widget-id="${diagramWidgetId}"]`,
+						);
+						if (diagramRoot) {
+							diagramRoot.setAttribute("data-diagram-code", mermaidCode);
+						}
+						const diagramOutEl = gridRef.querySelector(
+							`[data-output-id="${diagramWidgetId}"]`,
+						);
+						if (diagramOutEl) diagramOutEl.textContent = mermaidCode;
+						setPanelOutput(diagramWidgetId, mermaidCode);
+						renderDiagramsInGrid(gridRef);
+					}
+				} else {
+					const errMsg = execution.error_message ?? "実行失敗";
+					if (badge) {
+						badge.className = "ai-status-badge ai-status-failed";
+						badge.textContent = "失敗";
+					}
+					const outEl = gridRef.querySelector(
+						`[data-output-id="${aiWidgetId}"]`,
+					);
+					if (outEl) outEl.textContent = errMsg;
+				}
+			}
+
+			setTemplateProgress({ active: true, message: "完了!" });
+			setTimeout(() => setTemplateProgress(null), 2000);
+			refreshConnections();
+			saveLayout(g, params.id);
+		} catch (err) {
+			console.error("Template execution failed:", err);
+			setTemplateProgress({
+				active: false,
+				message: `エラー: ${err}`,
+			});
+			setTimeout(() => setTemplateProgress(null), 5000);
+		}
 	};
 
 	const handleTypeCustomize = (type: WidgetType) => {
@@ -287,6 +700,26 @@ export default function Dashboard() {
 				root?.getAttribute("data-ai-orchestration-mode") ?? "none";
 		}
 
+		// フォルダフィールド
+		let folderPath = "";
+		let folderMaxDepth = 3;
+		let folderExcludePatterns = DEFAULT_EXCLUDE_PATTERNS.join("\n");
+		if (type === "folder") {
+			folderPath = root?.getAttribute("data-folder-path") ?? "";
+			folderMaxDepth = Number(
+				root?.getAttribute("data-folder-max-depth") ?? "3",
+			);
+			folderExcludePatterns =
+				root?.getAttribute("data-folder-exclude") ||
+				DEFAULT_EXCLUDE_PATTERNS.join("\n");
+		}
+
+		// ダイアグラムフィールド
+		let diagramCode = "";
+		if (type === "visual" && visualSubType === "diagram") {
+			diagramCode = root?.getAttribute("data-diagram-code") ?? "";
+		}
+
 		setPanelConfig({
 			type,
 			visualSubType,
@@ -304,6 +737,10 @@ export default function Dashboard() {
 			aiMaxTokens: 1024,
 			aiProviderId: "",
 			aiOrchestrationMode,
+			folderPath,
+			folderMaxDepth,
+			folderExcludePatterns,
+			diagramCode,
 		});
 
 		setEditingWidgetId(widgetId);
@@ -322,6 +759,8 @@ export default function Dashboard() {
 				return <BotIcon size={size} />;
 			case "object":
 				return <BoxIcon size={size} />;
+			case "folder":
+				return <FolderIcon size={size} />;
 		}
 	};
 
@@ -435,6 +874,7 @@ export default function Dashboard() {
 
 		setEditorOpen(false);
 		refreshConnections();
+		renderDiagramsInGrid(gridRef);
 	};
 
 	const updateConfig = <K extends keyof PanelConfig>(
@@ -474,6 +914,10 @@ export default function Dashboard() {
 			aiMaxTokens: cfg.aiMaxTokens,
 			aiProviderId: cfg.aiProviderId,
 			aiOrchestrationMode: cfg.aiOrchestrationMode,
+			folderPath: cfg.folderPath,
+			folderMaxDepth: cfg.folderMaxDepth,
+			folderExcludePatterns: cfg.folderExcludePatterns,
+			diagramCode: cfg.diagramCode,
 			savedAt: new Date().toLocaleString("ja-JP"),
 		};
 		const updated = [draft, ...drafts()];
@@ -499,6 +943,11 @@ export default function Dashboard() {
 			aiMaxTokens: draft.aiMaxTokens ?? 1024,
 			aiProviderId: draft.aiProviderId ?? "",
 			aiOrchestrationMode: draft.aiOrchestrationMode ?? "none",
+			folderPath: draft.folderPath ?? "",
+			folderMaxDepth: draft.folderMaxDepth ?? 3,
+			folderExcludePatterns:
+				draft.folderExcludePatterns ?? DEFAULT_EXCLUDE_PATTERNS.join("\n"),
+			diagramCode: draft.diagramCode ?? "",
 		});
 		setDraftsOpen(false);
 	};
@@ -554,6 +1003,25 @@ export default function Dashboard() {
 					setWidgetCount(0);
 				}
 
+				// パイプラインエッジ読込 or マイグレーション
+				const savedEdges = loadPipelineEdges(id);
+				if (savedEdges.length > 0) {
+					setPipelineEdges(savedEdges);
+				} else {
+					// 既存aiLinkedPanelsからマイグレーション
+					const migrated = migrateLinkedPanelsToEdges();
+					if (migrated.length > 0) {
+						setPipelineEdges(migrated);
+						savePipelineEdges(id, migrated);
+					}
+				}
+				setPipelineStatus("idle");
+				setPanelOutputs({});
+				setCurrentPipelineStep(null);
+
+				// 保存済みダイアグラムを描画
+				renderDiagramsInGrid(gridRef);
+
 				const autoSave = () => saveLayout(g, id);
 				g.on("change", () => {
 					autoSave();
@@ -562,9 +1030,28 @@ export default function Dashboard() {
 				g.on("added", () => {
 					autoSave();
 					refreshConnections();
+					renderDiagramsInGrid(gridRef);
 				});
-				g.on("removed", () => {
+				g.on("removed", (_event: Event, items: unknown) => {
 					autoSave();
+					// パネル削除時に関連エッジをカスケード削除
+					if (Array.isArray(items)) {
+						for (const item of items) {
+							const el = (item as { el?: HTMLElement }).el;
+							const root = el?.querySelector("[data-widget-id]");
+							const wid = Number(root?.getAttribute("data-widget-id"));
+							if (!Number.isNaN(wid) && wid > 0) {
+								const updated = pipelineEdges().filter(
+									(edge) =>
+										edge.sourceWidgetId !== wid && edge.targetWidgetId !== wid,
+								);
+								if (updated.length !== pipelineEdges().length) {
+									setPipelineEdges(updated);
+									savePipelineEdges(id, updated);
+								}
+							}
+						}
+					}
 					refreshConnections();
 				});
 				g.on("dragstart", () => setDragging(true));
@@ -581,8 +1068,45 @@ export default function Dashboard() {
 				// ウィジェットアクション用イベント委譲
 				const cleanupDelegation = setupGridEventDelegation(gridRef, g, {
 					handleEditWidget,
+					getPipelineEdges: () => pipelineEdges(),
+					getPanelOutputs: () => panelOutputs(),
+					setPanelOutput,
 				});
 				onCleanup(() => cleanupDelegation());
+
+				// ポートドラッグ接続
+				if (svgRef) {
+					const cleanupPortDrag = setupPortDragHandler(gridRef, svgRef, {
+						getEdges: () => pipelineEdges(),
+						addEdge: addPipelineEdge,
+						getAllWidgetIds,
+					});
+					onCleanup(() => cleanupPortDrag());
+
+					// エッジ右クリックコンテキストメニュー
+					const edgeContextAc = new AbortController();
+					svgRef.addEventListener(
+						"contextmenu",
+						(e) => {
+							const target = e.target as Element;
+							const edgeId = target.getAttribute("data-edge-id");
+							if (edgeId) {
+								e.preventDefault();
+								setEdgeContextMenu({
+									x: e.clientX,
+									y: e.clientY,
+									edgeId,
+								});
+							}
+						},
+						{ signal: edgeContextAc.signal },
+					);
+					// クリックでコンテキストメニューを閉じる
+					document.addEventListener("click", () => setEdgeContextMenu(null), {
+						signal: edgeContextAc.signal,
+					});
+					onCleanup(() => edgeContextAc.abort());
+				}
 
 				setGrid(g);
 				refreshConnections();
@@ -601,49 +1125,172 @@ export default function Dashboard() {
 		<div class="dashboard-container">
 			<div class="dashboard-header">
 				<h1>{itemName()}</h1>
-				<button type="button" class="btn-add" onClick={openAddPanel}>
-					<PlusIcon size={16} />
-					Add Panel
-				</button>
+				<div class="dashboard-header-actions">
+					<For each={WORKFLOW_TEMPLATES}>
+						{(tmpl) => (
+							<button
+								type="button"
+								class="btn-template"
+								onClick={() => createFromTemplate(tmpl.id)}
+								disabled={templateProgress()?.active}
+								title={tmpl.description}
+							>
+								<ZapIcon size={14} />
+								{tmpl.label}
+							</button>
+						)}
+					</For>
+					<button type="button" class="btn-add" onClick={openAddPanel}>
+						<PlusIcon size={16} />
+						Add Panel
+					</button>
+				</div>
 			</div>
+
+			{/* テンプレート進捗バー */}
+			<Show when={templateProgress()}>
+				{(p) => (
+					<div class="template-progress-bar">
+						<div class="template-progress-spinner" />
+						<span>{p().message}</span>
+					</div>
+				)}
+			</Show>
+
+			{/* パイプラインツールバー */}
+			<Show when={pipelineEdges().length > 0}>
+				<div class="pipeline-toolbar">
+					<button
+						type="button"
+						class="pipeline-btn pipeline-btn-run"
+						disabled={pipelineStatus() === "running"}
+						onClick={handlePipelineExecute}
+					>
+						<PlayIcon size={14} />
+						パイプライン実行
+					</button>
+					<button
+						type="button"
+						class="pipeline-btn pipeline-btn-stop"
+						disabled={pipelineStatus() !== "running"}
+						onClick={handlePipelineStop}
+					>
+						<SquareIcon size={14} />
+						停止
+					</button>
+					<span
+						class="pipeline-status-badge"
+						classList={{
+							"pipeline-status-idle": pipelineStatus() === "idle",
+							"pipeline-status-running": pipelineStatus() === "running",
+							"pipeline-status-completed": pipelineStatus() === "completed",
+							"pipeline-status-failed": pipelineStatus() === "failed",
+							"pipeline-status-stopped": pipelineStatus() === "stopped",
+						}}
+					>
+						{pipelineStatus() === "idle"
+							? "待機中"
+							: pipelineStatus() === "running"
+								? "実行中"
+								: pipelineStatus() === "completed"
+									? "完了"
+									: pipelineStatus() === "failed"
+										? "失敗"
+										: "停止"}
+					</span>
+					<Show when={currentPipelineStep() !== null}>
+						<span class="pipeline-step-indicator">
+							Step: #{currentPipelineStep()}
+						</span>
+					</Show>
+					<span class="pipeline-edge-count">
+						{pipelineEdges().length} エッジ
+					</span>
+				</div>
+			</Show>
 
 			<div class="dashboard-grid-area">
 				<div ref={gridRef} class="grid-stack" />
 
-				{/* AIパネルと連携パネル間の接続線 */}
-				<Show when={!dragging()}>
-					<svg
-						class="connections-svg"
-						role="img"
-						aria-label="Panel connections"
-					>
-						<For each={connections()}>
-							{(c) => (
-								<g data-anim={animKey()}>
-									<circle
-										cx={c.fromX}
-										cy={c.fromY}
-										r={3.5}
-										class="connection-dot"
-										style={{ fill: c.color }}
-									/>
-									<circle
-										cx={c.toX}
-										cy={c.toY}
-										r={3.5}
-										class="connection-dot"
-										style={{ fill: c.color }}
-									/>
+				{/* パネル接続線（矢印付き有向グラフ） */}
+				<svg
+					ref={svgRef}
+					class="connections-svg"
+					role="img"
+					aria-label="Panel connections"
+					style={{ display: dragging() ? "none" : undefined }}
+				>
+					<defs>
+						<marker
+							id="arrowhead"
+							markerWidth="8"
+							markerHeight="6"
+							refX="8"
+							refY="3"
+							orient="auto"
+						>
+							<polygon points="0 0, 8 3, 0 6" fill="#6a1b9a" />
+						</marker>
+						<marker
+							id="arrowhead-autochain"
+							markerWidth="8"
+							markerHeight="6"
+							refX="8"
+							refY="3"
+							orient="auto"
+						>
+							<polygon points="0 0, 8 3, 0 6" fill="#1565c0" />
+						</marker>
+					</defs>
+					<For each={connections()}>
+						{(c) => (
+							<g
+								data-anim={animKey()}
+								data-edge-id={c.edgeId}
+								class="connection-group"
+							>
+								<circle
+									cx={c.fromX}
+									cy={c.fromY}
+									r={3.5}
+									class="connection-dot"
+									style={{ fill: c.color }}
+								/>
+								<circle
+									cx={c.toX}
+									cy={c.toY}
+									r={3.5}
+									class="connection-dot"
+									style={{ fill: c.color }}
+								/>
+								<path
+									d={connectionPath(c)}
+									class={
+										c.isAutoChain
+											? "connection-line connection-line-autochain"
+											: "connection-line"
+									}
+									style={{ stroke: c.isAutoChain ? "#1565c0" : c.color }}
+									marker-end={
+										c.edgeId
+											? c.isAutoChain
+												? "url(#arrowhead-autochain)"
+												: "url(#arrowhead)"
+											: undefined
+									}
+								/>
+								{/* 接続線のヒットエリア（右クリック用） */}
+								<Show when={c.edgeId}>
 									<path
 										d={connectionPath(c)}
-										class="connection-line"
-										style={{ stroke: c.color }}
+										class="connection-hitarea"
+										data-edge-id={c.edgeId}
 									/>
-								</g>
-							)}
-						</For>
-					</svg>
-				</Show>
+								</Show>
+							</g>
+						)}
+					</For>
+				</svg>
 
 				{/* パネルオーバーレイ（統合: 選択 + エディター） */}
 				<Show when={editorOpen()}>
@@ -824,8 +1471,10 @@ export default function Dashboard() {
 															<div class="fp-visual-subtype-icon">
 																{sub.type === "chart" ? (
 																	<BarChart3Icon size={20} />
-																) : (
+																) : sub.type === "table" ? (
 																	<TableIcon size={20} />
+																) : (
+																	<Share2Icon size={20} />
 																)}
 															</div>
 															<span class="fp-visual-subtype-label">
@@ -839,6 +1488,41 @@ export default function Dashboard() {
 												</For>
 											</div>
 										</div>
+
+										{/* ダイアグラム -> Mermaidコード入力 */}
+										<Show
+											when={panelConfig().visualSubType === "diagram"}
+										>
+											<div class="fp-diagram-editor">
+												<div class="fp-field-label">Mermaidコード</div>
+												<div class="fp-diagram-template-btns">
+													<button
+														type="button"
+														class="fp-btn fp-btn-ghost"
+														onClick={() =>
+															updateConfig(
+																"diagramCode",
+																DEFAULT_ER_DIAGRAM,
+															)
+														}
+													>
+														ER図テンプレート
+													</button>
+												</div>
+												<textarea
+													class="fp-diagram-textarea"
+													value={panelConfig().diagramCode}
+													onInput={(e) =>
+														updateConfig(
+															"diagramCode",
+															e.currentTarget.value,
+														)
+													}
+													placeholder={`erDiagram\n    CUSTOMER ||--o{ ORDER : places\n    ...`}
+													rows={12}
+												/>
+											</div>
+										</Show>
 									</Show>
 
 									{/* AI -> エージェント設定 + プロンプト + 連携パネル */}
@@ -1045,6 +1729,80 @@ export default function Dashboard() {
 									<Show when={panelConfig().type === "object"}>
 										<div class="fp-placeholder-msg">
 											オブジェクトパネルの設定は後日追加予定です。
+										</div>
+									</Show>
+
+									{/* フォルダ -> パス選択・深さ・除外パターン */}
+									<Show when={panelConfig().type === "folder"}>
+										<div class="fp-folder-content">
+											<div class="fp-folder-section">
+												<div class="fp-field-label">フォルダパス</div>
+												<div class="fp-folder-path-row">
+													<input
+														type="text"
+														class="fp-field-input"
+														value={panelConfig().folderPath}
+														onInput={(e) =>
+															updateConfig("folderPath", e.currentTarget.value)
+														}
+														placeholder="フォルダパスを入力..."
+													/>
+													<button
+														type="button"
+														class="fp-btn fp-btn-folder-pick"
+														onClick={async () => {
+															const picked = await openFolderPicker();
+															if (picked) {
+																updateConfig("folderPath", picked);
+															}
+														}}
+													>
+														<FolderOpenIcon size={14} />
+														選択
+													</button>
+												</div>
+											</div>
+											<div class="fp-folder-section">
+												<label class="fp-field-label">
+													深さ制限
+													<div class="fp-ai-slider-row">
+														<input
+															type="range"
+															class="fp-size-slider"
+															min={1}
+															max={10}
+															step={1}
+															value={panelConfig().folderMaxDepth}
+															onInput={(e) =>
+																updateConfig(
+																	"folderMaxDepth",
+																	Number.parseInt(e.currentTarget.value, 10),
+																)
+															}
+														/>
+														<span class="fp-ai-slider-value">
+															{panelConfig().folderMaxDepth}
+														</span>
+													</div>
+												</label>
+											</div>
+											<div class="fp-folder-section">
+												<label class="fp-field-label">
+													除外パターン（改行区切り）
+													<textarea
+														class="fp-ai-textarea"
+														value={panelConfig().folderExcludePatterns}
+														onInput={(e) =>
+															updateConfig(
+																"folderExcludePatterns",
+																e.currentTarget.value,
+															)
+														}
+														placeholder={"node_modules\n.git\ndist"}
+														rows={6}
+													/>
+												</label>
+											</div>
 										</div>
 									</Show>
 								</Show>
@@ -1321,6 +2079,42 @@ export default function Dashboard() {
 					</div>
 				</Show>
 			</div>
+
+			{/* エッジコンテキストメニュー */}
+			<Show when={edgeContextMenu()}>
+				{(menu) => (
+					<div
+						class="edge-context-menu"
+						style={{
+							left: `${menu().x}px`,
+							top: `${menu().y}px`,
+						}}
+					>
+						<button
+							type="button"
+							class="edge-context-menu-item"
+							onClick={() => {
+								toggleEdgeAutoChain(menu().edgeId);
+								setEdgeContextMenu(null);
+							}}
+						>
+							{pipelineEdges().find((e) => e.id === menu().edgeId)?.autoChain
+								? "Auto-chain 無効化"
+								: "Auto-chain 有効化"}
+						</button>
+						<button
+							type="button"
+							class="edge-context-menu-item edge-context-menu-item-danger"
+							onClick={() => {
+								removePipelineEdge(menu().edgeId);
+								setEdgeContextMenu(null);
+							}}
+						>
+							エッジを削除
+						</button>
+					</div>
+				)}
+			</Show>
 		</div>
 	);
 }

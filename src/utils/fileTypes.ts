@@ -48,6 +48,28 @@ const TEXT_EXTENSIONS = new Set([
 	"gitignore",
 	"dockerfile",
 	"makefile",
+	"lock",
+	"editorconfig",
+	"prettierrc",
+	"eslintrc",
+	"npmrc",
+	"nvmrc",
+	"example",
+]);
+
+/** 拡張子がなくてもテキストと判定するファイル名 */
+const TEXT_FILENAMES = new Set([
+	"makefile",
+	"dockerfile",
+	"license",
+	"readme",
+	"changelog",
+	"authors",
+	".editorconfig",
+	".browserslistrc",
+	".prettierrc",
+	".eslintrc",
+	".gitattributes",
 ]);
 
 const MIME_MAP: Record<string, string> = {
@@ -89,6 +111,14 @@ export function detectFileContentType(path: string): FileContentType | null {
 	const ext = getExtension(path);
 	if (IMAGE_EXTENSIONS.has(ext)) return "image";
 	if (TEXT_EXTENSIONS.has(ext)) return "text";
+
+	// 拡張子なし or 未知拡張子 → ファイル名で判定
+	const name = path.split(/[/\\]/).pop()?.toLowerCase() ?? "";
+	if (TEXT_FILENAMES.has(name)) return "text";
+
+	// .env.* パターン（.env.local, .env.production 等）
+	if (name.startsWith(".env")) return "text";
+
 	return null;
 }
 
