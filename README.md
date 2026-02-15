@@ -1,77 +1,127 @@
-## 何をやりたいか
-再利用できる設計を考える。
+# tebiki
 
-最低限UIのコア設定、APIのデータ取得は特別な仕様を構築する。外部利用の可能性が少しでもあるインターフェースは汎用的にする。
+AI エージェントオーケストレーション・ダッシュボード。
+複数の AI エージェントをビジュアルに接続・実行し、ワークフローを構築するデスクトップアプリケーション。
 
-一つのDBで複数のマイクロサービスが動かせることを常に考えること(この能力がないと楽しく生きていけないので)。
+## 特徴
+
+- **ビジュアルパイプラインエディタ** — パネルをドラッグ＆ドロップで配置し、ポート接続で DAG ベースのワークフローを構築
+- **マルチエージェントオーケストレーション** — 承認フロー付きの多段エージェント実行、autoChain による自動連鎖
+- **5 種類のウィジェット** — Text / Visual (Chart・Table・Diagram) / AI / Folder / Object
+- **リアルタイム更新** — WebSocket によるエージェント実行状況のライブ表示
+- **テンプレートシステム** — ワークフローの保存・復元・スナップショット共有
+- **Mermaid ダイアグラム** — ER 図・フローチャート等を自動レンダリング
+- **ローカルファースト** — デスクトップネイティブでデータ主権を確保
+
+## 技術スタック
+
+| レイヤー | 技術 |
+|---------|------|
+| フロントエンド | SolidJS, TypeScript, Vite |
+| デスクトップ | Tauri v2 |
+| バックエンド | Rust (Axum), WebSocket |
+| データベース | PostgreSQL 16 (Docker) |
+| レイアウト | GridStack (48 カラム) |
+| リッチテキスト | Lexical (lexical-solid) |
+| ダイアグラム | Mermaid |
+| LLM | Anthropic Claude API |
+| コード品質 | Biome (フォーマット・リント) |
+
+## 前提条件
+
+- [Rust](https://rustup.rs/) (stable)
+- [Bun](https://bun.sh/) (または npm)
+- [Docker](https://www.docker.com/) (PostgreSQL 用)
+- Tauri v2 の[システム依存パッケージ](https://v2.tauri.app/start/prerequisites/)
+
+## セットアップ
 
 ```bash
+# 依存パッケージのインストール
+bun install
+
+# PostgreSQL を起動
+bun run db:up
+
+# Tauri アプリとして起動
 bun run tauri dev
-# or
-bun run dev
 ```
 
-<img width="340" height="855" alt="image" src="https://github.com/user-attachments/assets/51d18a11-3c43-472e-a27c-2ab620147903" />
+## 開発コマンド
 
+```bash
+# フロントエンド開発サーバー (Vite)
+bun run dev
 
+# Tauri デスクトップアプリとして起動
+bun run tauri dev
 
-あなたは優秀なフロントエンドエンジニアです。あなたの目的は指示に従って実装を追加することです。
-まずは、このプロジェクトのコードを読んで下さい。
-このプロジェクトのフロントエンド開発ではsolid.jsとark-uiを使って開発をしています。
+# ビルド
+bun run build          # フロントエンドのみ
+bun run tauri build    # デスクトップアプリ
 
+# コード品質
+bun run format         # Biome フォーマット
+bun run lint           # Biome リント
+bun run check          # フォーマット + リント + 自動修正
 
-あなたは優秀なフルスタックエンジニアです。あなたの目的は指示に従って実装を追加することです。
-まずは、このプロジェクトのコードを読んで下さい。
-このプロジェクトはtauri + solid.jsを使って開発をしています。
+# データベース
+bun run db:up          # PostgreSQL 起動
+bun run db:down        # PostgreSQL 停止
+bun run db:reset       # データベースリセット (データ削除)
+```
 
-あなたは優秀なプロダクト開発者です。
-このプロジェクトでは「AIエージェントのオーケストレーションを可視化・監視するダッシュボード」を目指しています。そのために必要な技術的戦略について教えてください。
+## ディレクトリ構成
 
-webでSigninをすると次のエラーになります。原因を教えてください。<input type="password" name="password"
-  placeholder="Password (8+ characters)" required minlength="8">                                            
-  api/auth/login:1  Failed to load resource: the server responded with a status of 404 (Not                 
-  Found)Understand this error
-  api.ts:68  POST http://localhost:1420/api/auth/login 404 (Not Found)
+```
+tebiki/
+├── src/                     # SolidJS フロントエンド
+│   ├── components/          # 再利用可能なコンポーネント
+│   │   ├── lexical/         #   リッチテキストエディタ
+│   │   ├── Sidebar/         #   サイドバーナビゲーション
+│   │   └── TreeView/        #   ツリービュー
+│   ├── pages/               # ページコンポーネント
+│   │   ├── Dashboard.tsx    #   メインダッシュボード
+│   │   └── dashboard/       #   ダッシュボード関連モジュール
+│   ├── contexts/            # コンテキスト (認証等)
+│   └── utils/               # ユーティリティ
+├── src-tauri/               # Rust バックエンド
+│   ├── src/
+│   │   ├── auth/            #   OAuth・認証
+│   │   ├── services/        #   ビジネスロジック
+│   │   ├── llm/             #   LLM プロバイダー
+│   │   ├── tools/           #   エージェント用ツール
+│   │   ├── handlers.rs      #   HTTP ハンドラ
+│   │   ├── ws.rs            #   WebSocket
+│   │   └── db.rs            #   DB接続プール
+│   └── migrations/          # SQLx マイグレーション
+├── doc/                     # 技術ドキュメント
+└── docker-compose.yml       # PostgreSQL
+```
 
+## アーキテクチャ
 
-tebiki vs Eden.so — 差別化の観点
-Eden.so の特徴
-Eden.so は "All Content, Files, & AI In One Place" を掲げるWebベースのワークスペースで、3つの柱があります：
+```
+┌─────────────────────────────────────────────┐
+│  SolidJS Frontend (TypeScript)              │
+│  ┌──────────┐ ┌──────────┐ ┌─────────────┐ │
+│  │ GridStack│ │ Lexical  │ │   Mermaid   │ │
+│  │ Dashboard│ │ Editor   │ │  Diagrams   │ │
+│  └────┬─────┘ └──────────┘ └─────────────┘ │
+│       │  WebSocket / REST API               │
+└───────┼─────────────────────────────────────┘
+        │
+┌───────┼─────────────────────────────────────┐
+│  Tauri v2 + Axum Backend (Rust)             │
+│       │                                     │
+│  ┌────┴─────┐ ┌──────────┐ ┌─────────────┐ │
+│  │ Pipeline │ │  Agent   │ │    Tool     │ │
+│  │  Engine  │ │ Service  │ │  Registry   │ │
+│  └──────────┘ └────┬─────┘ └─────────────┘ │
+│                    │                        │
+│  ┌─────────────────┴──────────────────────┐ │
+│  │         PostgreSQL (sqlx)              │ │
+│  └────────────────────────────────────────┘ │
+└─────────────────────────────────────────────┘
+```
 
-Better Drive — ファイル・リンク・ノートを保存すると自動で文字起こし・タグ付け・AI参照可能に
-Visual Search — 「ピンクのセーター」等の記述で動画フレームやPDFの該当箇所を検索
-Canvas with Spatial AI — ファイル/リンク/ノートをキャンバスに配置し、AIチャットに接続
-ターゲットは 個人クリエイター・コンテンツ制作者。月額$29〜のSaaS。
-
-tebiki が差別化できる観点
-観点	Eden.so	tebiki の強み
-実行モデル	AIチャット（対話型）	DAGパイプライン（複数AIを順序実行、自動チェーン）
-プラットフォーム	Web SaaS（クラウド依存）	デスクトップネイティブ（Tauri、ローカルファイル直接アクセス）
-データ主権	クラウドにアップロード必須	ローカルファースト（ファイルはPC上、APIキーのみ外部）
-AI構造化	1対1のチャット接続	マルチエージェントオーケストレーション（承認フロー、サブエージェント生成）
-接続の可視化	キャンバス上でドラッグ	有向グラフ+SVG接続線（Bézierパス、ポートドラッグ）
-出力形式	テキスト返答	構造化出力（ER図/Mermaid SVG描画、チャート、テーブル等）
-拡張性	閉じたSaaS	オープンアーキテクチャ（LLMプロバイダー選択可、ウィジェット追加可能）
-具体的に攻められるポイント
-1. パイプライン実行エンジン（最大の差別化）
-
-Eden のCanvasは「ファイル → AIチャット」の1段接続。tebiki は フォルダ → AI(要約) → AI(ER図生成) → ダイアグラム表示 のような多段DAG実行ができる。トポロジカルソートによる依存解決と自動チェーン（autoChain）は、Eden にない機能。
-
-2. ローカルファイルシステム統合
-
-Eden はファイルをクラウドにアップロードする前提。tebiki は Tauri の FS プラグインでローカルのコードベースやプロジェクトフォルダを直接スキャンできる。機密データをクラウドに出さずにAI処理できるのはエンタープライズ・開発者向けの強力な訴求点。
-
-3. マルチエージェントオーケストレーション
-
-Eden は単一AIチャット。tebiki は1つのパイプライン内で複数エージェントを連携させ、承認フロー付きで実行できる。「計画提案 → 人間承認 → 実行」のワークフローはAIガバナンスの観点で差別化。
-
-4. 構造化ビジュアル出力
-
-Eden のAI出力はテキスト。tebiki は AI出力を Mermaid ER図、チャート、テーブル として直接レンダリングできる。「AIが生成したものを即座にビジュアライズ」はクリエイティブ用途と開発用途の両方で価値がある。
-
-5. LLMプロバイダー非依存
-
-tebiki はプロバイダー/モデルをパネルごとに選択でき、特定のAIベンダーにロックインされない。
-
-推奨ポジショニング
-Eden が 「個人のコンテンツ整理 + AIチャット」 なのに対し、tebiki は 「AIエージェントのビジュアルオーケストレーション + ローカルファースト」 として位置づけるのが最も差別化が明確です。特に「パイプライン実行」と「ローカルデータ主権」の2軸が、Eden と重ならない独自の価値になります。
